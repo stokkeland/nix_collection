@@ -1,7 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# ini_get and ini_set will wrap this
 # based on old script expanded a bit with ChatGPT
 
 LOCK_FD=200
