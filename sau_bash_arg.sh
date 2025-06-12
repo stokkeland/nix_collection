@@ -1,8 +1,18 @@
 #!/bin/bash
 #
 # sau_bash_arg.sh
+#
+# VERSION: 2025-02-01
+# https://github.com/stokkeland/nix_collection/blob/main/sau_bash_arg.sh
+# 
 # Usable in your own scripts, just source this is and process arguments
 # and validate without thinking too much about it, same way in every script.
+#
+# Some have asked "Why don't you use this in the other scripts",  it is
+# Because this is a relatively new add (2025) and most of the other stuff
+# was older..  but yes i got tired of copy/paste/edit the argument 
+# management on the others and will be using this in my base bash sourced
+# library going forward (that does add dendencies)
 #
 # Generated with Claude AI - some adjustments
 #################################################################
