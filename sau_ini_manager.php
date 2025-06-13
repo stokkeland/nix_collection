@@ -9,7 +9,7 @@
  *   the companion bash script to prevent concurrent modifications.
  *
  * There is a bash script available that does the same thing, use the same lock files
- *   https://github.com/stokkeland/nix_collection/edit/main/sau_ini
+ *   https://github.com/stokkeland/nix_collection/blob/main/sau_ini
  *
  * Features:
  *   - Read individual keys, sections, or entire INI files
