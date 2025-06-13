@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Sau INI Manager - An INI file manipulation tool
+# Sau INI Manager - An INI file manipulation tool, safe edits, with lock files
 #
 # There is also a PHP class available, uses same lock files
 #   https://github.com/stokkeland/nix_collection/blob/main/sau_ini_manager.php
@@ -60,7 +60,7 @@ set -euo pipefail
 LOCK_FD=200
 LOCK_RETRIES=10
 LOCK_WAIT=0.1
-LOCK_TIMEOUT=120  # 2 minutes in seconds
+LOCK_TIMEOUT=120  # 2 minutes
 
 INI_FILE=""
 SECTION=""
