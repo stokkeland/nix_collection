@@ -1,11 +1,66 @@
 #!/bin/bash
 set -euo pipefail
 
-# based on old script expanded a bit with ChatGPT
+# Sau INI Manager - An INI file manipulation tool
+#
+# There is also a PHP class available, uses same lock files
+#   https://github.com/stokkeland/nix_collection/blob/main/sau_ini_manager.php
+# 
+# Description:
+#   This script provides safe, atomic operations for reading, writing, and deleting
+#   keys in INI configuration files. It uses file locking to prevent concurrent
+#   modifications and preserves file permissions and ownership.
+#
+# Features:
+#   - Read individual keys or list sections/keys
+#   - Write/update key-value pairs (creates sections if needed)
+#   - Delete individual keys
+#   - Atomic operations with file locking
+#   - Preserves file permissions and ownership
+#   - Trims whitespace from read values
+#   - Validates INI file format
+#   - Handles stale locks (removes locks older than 2 minutes)
+#
+# Usage Examples:
+#   # Read a value
+#   ./ini_manager.sh -r -s database -k host config.ini
+#   
+#   # Write a value (creates section if it doesn't exist)
+#   ./ini_manager.sh -w -s database -k host -v localhost config.ini
+#   
+#   # Delete a key
+#   ./ini_manager.sh -d -s database -k password config.ini
+#   
+#   # List all sections
+#   ./ini_manager.sh --list-sections config.ini
+#   
+#   # List keys in a section
+#   ./ini_manager.sh --list-keys -s database config.ini
+#   
+#   # Show entire file
+#   ./ini_manager.sh --show-all config.ini
+#
+# Exit Codes:
+#   Read operations:
+#     0 - Success (found key or section)
+#     1 - Section missing
+#     2 - File missing/unreadable
+#     3 - Format invalid
+#     4 - Key missing in section
+#   101 - Bad usage
+#   
+#   Write/Delete operations:
+#     0 - Success
+#     1 - Failed to perform action
+#   101 - Bad usage
+#
+# Authors: Based on old script expanded with ChatGPT, then fixed with Claude AI
+# Version: rev 15
 
 LOCK_FD=200
 LOCK_RETRIES=10
 LOCK_WAIT=0.1
+LOCK_TIMEOUT=120  # 2 minutes in seconds
 
 INI_FILE=""
 SECTION=""
@@ -63,7 +118,11 @@ read_ini_value() {
 
         [[ $found_section -eq 1 && "$line" =~ ^[[:space:]]*([^#;].*?)=(.*) ]] && {
             if [[ "${BASH_REMATCH[1]// /}" == "$KEY" ]]; then
-                echo "${BASH_REMATCH[2]}" && return 0
+                # Remove leading and trailing whitespace from value
+                local value="${BASH_REMATCH[2]}"
+                value="${value#"${value%%[![:space:]]*}"}"  # Remove leading whitespace
+                value="${value%"${value##*[![:space:]]}"}"  # Remove trailing whitespace
+                echo "$value" && return 0
             fi
         }
     done < "$INI_FILE"
@@ -82,6 +141,13 @@ write_ini_value() {
     local in_section=0
     local key_written=0
     local section_written=0
+
+    # Ensure temp file is writable, then preserve original file permissions and ownership
+    chmod 600 "$tmp_file"  # Ensure we can write to temp file
+    local preserve_perms=""
+    if [[ -f "$INI_FILE" ]]; then
+        preserve_perms=$(stat -c "%a" "$INI_FILE" 2>/dev/null || echo "")
+    fi
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" =~ ^[[:space:]]*\[.*\][[:space:]]*$ ]]; then
@@ -121,6 +187,14 @@ write_ini_value() {
         echo "$KEY=$VALUE" >> "$tmp_file"
     fi
 
+    # Apply original permissions to final file
+    if [[ -n "$preserve_perms" ]]; then
+        chmod "$preserve_perms" "$tmp_file" 2>/dev/null || true
+    fi
+    if [[ -f "$INI_FILE" ]]; then
+        chown --reference="$INI_FILE" "$tmp_file" 2>/dev/null || true
+    fi
+    
     mv "$tmp_file" "$INI_FILE"
     return 0
 }
@@ -132,6 +206,21 @@ delete_ini_key() {
 
     local tmp_file
     tmp_file=$(mktemp)
+
+    # Ensure temp file is writable, then preserve original file permissions and ownership
+    chmod 600 "$tmp_file"  # Ensure we can write to temp file
+    local preserve_perms=""
+    if [[ -f "$INI_FILE" ]]; then
+        preserve_perms=$(stat -c "%a" "$INI_FILE" 2>/dev/null || echo "")
+    fi
+
+    # Apply original permissions to final file
+    if [[ -n "$preserve_perms" ]]; then
+        chmod "$preserve_perms" "$tmp_file" 2>/dev/null || true
+    fi
+    if [[ -f "$INI_FILE" ]]; then
+        chown --reference="$INI_FILE" "$tmp_file" 2>/dev/null || true
+    fi
 
     awk -v section="$SECTION" -v key="$KEY" '
     BEGIN {in_section=0}
@@ -196,13 +285,52 @@ main() {
 
     [[ -z "$INI_FILE" ]] && log "INI file required" && usage && exit 101
 
-    LOCK_FILE="/tmp/ini_manager.$(basename "$INI_FILE").lock"
+    # Create lock file in same directory as INI file, or use /tmp with proper permissions
+    local ini_dir
+    ini_dir=$(dirname "$INI_FILE")
+	
+	if [[ -w "$ini_dir" ]]; then
+		LOCK_FILE="$ini_dir/.$(basename "$INI_FILE").lock"
+	else
+		# Use absolute path hash to ensure same lock file for same INI file
+		local abs_path
+		abs_path=$(realpath "$INI_FILE" 2>/dev/null || readlink -f "$INI_FILE" 2>/dev/null || echo "$INI_FILE")
+		local path_hash
+		path_hash=$(echo "$abs_path" | md5sum 2>/dev/null | cut -d' ' -f1 || echo "$(basename "$INI_FILE")")
+		LOCK_FILE="/tmp/ini_manager.${path_hash}.lock"
+	fi
+    
+    # Check if lock file is stale (older than LOCK_TIMEOUT seconds) before touching it
+    if [[ -f "$LOCK_FILE" ]]; then
+        local lock_age
+        lock_age=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
+        if [[ $lock_age -gt $LOCK_TIMEOUT ]]; then
+            log "Removing stale lock file (${lock_age}s old, timeout: ${LOCK_TIMEOUT}s)"
+            rm -f "$LOCK_FILE" 2>/dev/null || true
+        fi
+    fi
+    
+    # Create lock file with appropriate permissions only if it doesn't exist
+    if [[ ! -f "$LOCK_FILE" ]]; then
+        touch "$LOCK_FILE" 2>/dev/null || {
+            log "Cannot create lock file: $LOCK_FILE"
+            exit 1
+        }
+        chmod 600 "$LOCK_FILE" 2>/dev/null || true
+    fi
+    
     exec {LOCK_FD}>"$LOCK_FILE" || exit 1
     for ((i = 1; i <= LOCK_RETRIES; i++)); do
         flock -xn "$LOCK_FD" && break
         [[ $i -eq LOCK_RETRIES ]] && log "Could not acquire lock" && exit 1
         sleep "$LOCK_WAIT"
     done
+    
+    # Cleanup function to remove lock file on exit
+    cleanup() {
+        [[ -n "${LOCK_FILE:-}" ]] && rm -f "$LOCK_FILE" 2>/dev/null || true
+    }
+    trap cleanup EXIT
 
     case "$ACTION" in
         read)
