@@ -11,6 +11,9 @@
  * There is a bash script available that does the same thing, use the same lock files
  *   https://github.com/stokkeland/nix_collection/blob/main/sau_ini
  *
+ * There is a class to handle simple json/ini read/write dependent on this script
+ *   https://github.com/stokkeland/nix_collection/blob/main/sau_ini_json_class.php
+ *
  * Features:
  *   - Read individual keys, sections, or entire INI files
  *   - Write/update key-value pairs (creates sections if needed)
