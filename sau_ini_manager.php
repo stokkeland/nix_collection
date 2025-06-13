@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Sau INI Manager - A robust PHP class for INI file manipulation with file locking
+ * Sau INI Manager - A PHP class for INI file manipulation with file locking
  * 
  * Description:
  *   This class provides safe, atomic operations for reading, writing, and deleting
