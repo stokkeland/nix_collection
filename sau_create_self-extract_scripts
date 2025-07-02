@@ -1,0 +1,168 @@
+#!/bin/bash
+
+# (c) Thomas Stokkeland / Sauen.Com - MIT License
+
+# sau_create_self-extract_scripts - Self-extracting Archive Creator
+# Usage: sau_create_self-extract_scripts <archive_name> <file1> <file2> ...
+
+# If you have a bunch of scripts you want to be portable in a single self extracting file - use this
+# Creates the extraction code on top and appends each file below it with separator markers
+# This will fail on binary/non-textual files
+
+# For those who ask - yes I did have a different version of this in the past that i used for the 
+# bl_sitemanager scripts, this "new" one is less prone to issues due to complex file content, it is
+# actually capable of wrapping itself
+
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <archive_name> <file1> <file2> ..."
+    echo "Creates a self-extracting archive containing the specified text files"
+    exit 1
+fi
+
+ARCHIVE_NAME="$1"
+shift
+
+# Validate that all files exist and are text files
+for file in "$@"; do
+    if [ ! -f "$file" ]; then
+        echo "Error: File '$file' not found"
+        exit 1
+    fi
+    
+    # Check if file is binary (simple check using file command)
+    if file "$file" | grep -q "binary\|data"; then
+        echo "Error: File '$file' appears to be binary. Only text files are supported."
+        exit 1
+    fi
+done
+
+# Create the self-extracting archive header
+cat > "$ARCHIVE_NAME" << 'EXTRACTOR_EOF'
+#!/bin/bash
+
+# Self-Extracting Archive
+# Usage: ./<archive_name> <extraction_directory>
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <extraction_directory>"
+    echo "Extracts all files to the specified directory"
+    exit 1
+fi
+
+EXTRACT_DIR="$1"
+
+# Create extraction directory if it doesn't exist
+if [ ! -d "$EXTRACT_DIR" ]; then
+    mkdir -p "$EXTRACT_DIR" || {
+        echo "Error: Cannot create directory '$EXTRACT_DIR'"
+        exit 1
+    }
+fi
+
+# Find where the archive data starts
+ARCHIVE_START=$(awk '/^__ARCHIVE_DATA_FOLLOWS__$/ { print NR + 1; exit 0; }' "$0")
+
+if [ -z "$ARCHIVE_START" ]; then
+    echo "Error: Archive data marker not found"
+    exit 1
+fi
+
+# Process the archive
+CURRENT_FILE=""
+CURRENT_PERMS=""
+LINES_REMAINING=0
+IN_FILE=0
+
+tail -n +$ARCHIVE_START "$0" | while IFS= read -r line; do
+    if [ $IN_FILE -eq 0 ]; then
+        # Look for file start marker
+        if [[ "$line" =~ ^__FILE_START__:([^:]+):([0-9]+):([0-9]+)__$ ]]; then
+            CURRENT_FILE="${BASH_REMATCH[1]}"
+            CURRENT_PERMS="${BASH_REMATCH[2]}"
+            LINES_REMAINING="${BASH_REMATCH[3]}"
+            IN_FILE=1
+            
+            echo "Extracting: $CURRENT_FILE (${LINES_REMAINING} lines)"
+            
+            # Start new file
+            > "$EXTRACT_DIR/$CURRENT_FILE"
+        fi
+    else
+        # We're inside a file
+        if [[ "$line" == "__FILE_END__" ]]; then
+            # End of current file
+            chmod "$CURRENT_PERMS" "$EXTRACT_DIR/$CURRENT_FILE"
+            IN_FILE=0
+            CURRENT_FILE=""
+            CURRENT_PERMS=""
+            LINES_REMAINING=0
+        else
+            # Regular file content
+            echo "$line" >> "$EXTRACT_DIR/$CURRENT_FILE"
+            ((LINES_REMAINING--))
+            
+            # Check if we've read all expected lines
+            if [ $LINES_REMAINING -eq 0 ]; then
+                # Next line should be __FILE_END__
+                IFS= read -r endline
+                if [[ "$endline" != "__FILE_END__" ]]; then
+                    echo "Warning: Expected __FILE_END__ for $CURRENT_FILE, got: $endline"
+                fi
+                chmod "$CURRENT_PERMS" "$EXTRACT_DIR/$CURRENT_FILE"
+                IN_FILE=0
+                CURRENT_FILE=""
+                CURRENT_PERMS=""
+            fi
+        fi
+    fi
+done
+
+echo "Extraction complete. Files extracted to: $EXTRACT_DIR"
+exit 0
+
+__ARCHIVE_DATA_FOLLOWS__
+EXTRACTOR_EOF
+
+# Now add each file to the archive
+for file in "$@"; do
+    # Get file permissions (in octal)
+    if [ -x "$file" ]; then
+        PERMS="755"
+    else
+        PERMS="644"
+    fi
+    
+    # Count lines in the file
+    LINES=$(wc -l < "$file")
+    # Remove any whitespace
+    LINES=$(echo "$LINES" | tr -d ' ')
+    
+    # Handle files that don't end with newline
+    if [ -z "$LINES" ] || [ "$LINES" -eq 0 ]; then
+        LINES=$(cat "$file" | wc -l)
+        if [ "$LINES" -eq 0 ]; then
+            LINES=1
+        fi
+    fi
+    
+    # Get just the filename (remove path)
+    BASENAME=$(basename "$file")
+    
+    echo "Adding: $BASENAME (permissions: $PERMS, lines: $LINES)"
+    
+    # Add file header
+    echo "__FILE_START__:${BASENAME}:${PERMS}:${LINES}__" >> "$ARCHIVE_NAME"
+    
+    # Add file content
+    cat "$file" >> "$ARCHIVE_NAME"
+    
+    # Add file footer
+    echo "__FILE_END__" >> "$ARCHIVE_NAME"
+done
+
+# Make the archive executable
+chmod +x "$ARCHIVE_NAME"
+
+echo ""
+echo "Self-extracting archive created: $ARCHIVE_NAME"
+echo "To extract, run: ./$ARCHIVE_NAME <extraction_directory>"
