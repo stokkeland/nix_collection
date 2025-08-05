@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""
+SAU Git Branch Diff Tool - Compare branches and create upgrade archives
+Usage: ./git-diff-tool.py <from-branch0> <to-branch> [options]
+
+IMPORTANT: Branches must be up-to-date with origin!
+=========================================================
+Before running comparisons, ensure your local branches are current:
+  git fetch --all                    # Fetch all remote changes
+  git pull origin main               # Update specific branch
+  git checkout main && git pull      # Switch and update
+
+This is especially important for branches like main/master where you
+don't do direct work - they can become stale without regular pulls.
+Always make sure the branches compared have been checked out on local repo.
+
+COMMON PITFALLS:
+  ❌ Comparing outdated local branches (especially main/master)
+  ❌ Forgetting to fetch tags when comparing version tags
+  ❌ Not backing up before applying upgrade archives
+  ❌ Forgetting to manually delete removed files
+
+DESCRIPTION:
+This script compares two git branches to identify changed files and can
+create deployment/upgrade packages containing only the modified files.
+Perfect for creating incremental updates without transferring entire codebases.
+
+INSTALLATION:
+  chmod +x git-diff-tool.py
+  # Optional: copy to PATH for system-wide use
+  sudo cp git-diff-tool.py /usr/local/bin/git-diff-tool
+
+EXAMPLES:
+  # Always fetch first (or use --fetch flag)
+  git fetch --all
+  
+  # Count changes between branches
+  ./git-diff-tool.py main feature/new-ui --count
+  
+  # List all changed files with categories
+  ./git-diff-tool.py v1.0.0 v2.0.0 --list --verbose
+  
+  # Create upgrade archive with auto-fetch
+  ./git-diff-tool.py production staging --archive --fetch
+  
+  # Do everything with custom output filename
+  ./git-diff-tool.py main develop --all --output upgrade_v2.tar.gz
+  
+  # Compare tags for release package
+  ./git-diff-tool.py v1.2.3 v1.3.0 --archive --output release_1.3.0.tar.gz
+  
+  # Skip update checks if you're certain branches are current
+  ./git-diff-tool.py dev prod --archive --no-check
+
+DEPLOYMENT WORKFLOW:
+  1. Update your branches: git fetch --all && git pull
+  2. Create upgrade package: ./git-diff-tool.py prod-v1 prod-v2 --archive
+  3. Transfer archive to production server
+  4. Backup current deployment (CRITICAL!)
+  5. Extract archive: tar -xzf upgrade_*.tar.gz
+  6. Review UPGRADE_MANIFEST.txt for any files to delete
+  7. Manually delete files if listed
+  8. Restart services/clear caches as needed
+  9. Verify deployment and test critical paths
+
+FEATURES:
+  - Identifies added, modified, and deleted files
+  - Creates tar.gz archives with only changed files
+  - Generates manifest with deployment instructions
+  - Warns if branches are out-of-date with remotes
+  - Handles renamed files correctly
+  - Auto-generates timestamped archive names
+  - Preserves directory structure in archives
+
+Author: Thomas Stokkeland - Assisted by Claude
+License: MIT
+Version: 2025-August
+"""
+
+import argparse
+import subprocess
+import sys
+import os
+import tarfile
+import tempfile
+from pathlib import Path
+from datetime import datetime
+
+class GitBranchDiff:
+    def __init__(self, from_branch, to_branch):
+        self.from_branch = from_branch
+        self.to_branch = to_branch
+        self.changed_files = []
+        self.added_files = []
+        self.modified_files = []
+        self.deleted_files = []
+        
+    def verify_git_repo(self):
+        """Check if we're in a git repository"""
+        try:
+            subprocess.run(['git', 'rev-parse', '--git-dir'], 
+                         check=True, capture_output=True, text=True)
+            return True
+        except subprocess.CalledProcessError:
+            print("Error: Not in a git repository", file=sys.stderr)
+            return False
+    
+    def check_branch_status(self, branch):
+        """Check if a branch is behind its remote tracking branch"""
+        try:
+            # Get the remote tracking branch
+            result = subprocess.run(
+                ['git', 'rev-parse', '--abbrev-ref', f'{branch}@{{upstream}}'],
+                capture_output=True, text=True
+            )
+            
+            if result.returncode == 0:
+                remote_branch = result.stdout.strip()
+                
+                # Check if local branch is behind remote
+                behind = subprocess.run(
+                    ['git', 'rev-list', '--count', f'{branch}..{remote_branch}'],
+                    capture_output=True, text=True
+                )
+                
+                behind_count = int(behind.stdout.strip()) if behind.stdout.strip() else 0
+                
+                if behind_count > 0:
+                    return False, behind_count
+                    
+            return True, 0
+            
+        except (subprocess.CalledProcessError, ValueError):
+            # Branch might not have upstream tracking, that's OK
+            return True, 0
+    
+    def fetch_updates(self):
+        """Fetch latest changes from all remotes"""
+        print("📡 Fetching latest changes from remotes...")
+        try:
+            subprocess.run(['git', 'fetch', '--all'], 
+                         check=True, capture_output=True, text=True)
+            print("✅ Fetched latest changes")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"⚠️  Warning: Could not fetch updates: {e}", file=sys.stderr)
+            return False
+    
+    def verify_branches(self, check_updates=True):
+        """Verify that both branches exist and optionally check if they're up-to-date"""
+        # First check if branches exist
+        for branch in [self.from_branch, self.to_branch]:
+            try:
+                subprocess.run(['git', 'rev-parse', '--verify', branch], 
+                             check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError:
+                print(f"Error: Branch '{branch}' does not exist", file=sys.stderr)
+                return False
+        
+        # Check if branches are up-to-date with their remotes
+        if check_updates:
+            warnings = []
+            for branch in [self.from_branch, self.to_branch]:
+                is_current, behind_count = self.check_branch_status(branch)
+                if not is_current:
+                    warnings.append((branch, behind_count))
+            
+            if warnings:
+                print("\n⚠️  WARNING: Local branches may be out of date!")
+                print("=" * 50)
+                for branch, count in warnings:
+                    print(f"  Branch '{branch}' is {count} commit(s) behind remote")
+                print("\nRecommended actions:")
+                print("  1. Run with --fetch flag to auto-fetch updates")
+                print("  2. Or manually update branches:")
+                print("     git fetch --all")
+                print(f"     git checkout {self.from_branch} && git pull")
+                print(f"     git checkout {self.to_branch} && git pull")
+                print("=" * 50)
+                
+                response = input("\nContinue anyway? (y/N): ")
+                if response.lower() != 'y':
+                    print("Aborted.")
+                    return False
+        
+        return True
+    
+    def get_changed_files(self):
+        """Get list of files that changed between branches"""
+        try:
+            # Get diff between branches
+            result = subprocess.run(
+                ['git', 'diff', '--name-status', f'{self.from_branch}..{self.to_branch}'],
+                check=True, capture_output=True, text=True
+            )
+            
+            # Parse the output
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                    
+                parts = line.split('\t')
+                if len(parts) >= 2:
+                    status = parts[0]
+                    filename = parts[1]
+                    
+                    # Handle renamed files (R status includes old and new names)
+                    if status.startswith('R'):
+                        if len(parts) >= 3:
+                            filename = parts[2]  # Use new name for renamed files
+                    
+                    if status in ['A']:  # Added
+                        self.added_files.append(filename)
+                        self.changed_files.append(filename)
+                    elif status in ['M']:  # Modified
+                        self.modified_files.append(filename)
+                        self.changed_files.append(filename)
+                    elif status in ['D']:  # Deleted
+                        self.deleted_files.append(filename)
+                    elif status.startswith('R'):  # Renamed
+                        self.modified_files.append(filename)
+                        self.changed_files.append(filename)
+                    else:  # Other changes (like mode changes)
+                        self.changed_files.append(filename)
+            
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            print(f"Error getting file differences: {e}", file=sys.stderr)
+            return False
+    
+    def count_files(self):
+        """Display count of changed files"""
+        print(f"\n📊 File Change Summary: {self.from_branch} → {self.to_branch}")
+        print("=" * 50)
+        print(f"Total changed files: {len(self.changed_files)}")
+        print(f"  ➕ Added:    {len(self.added_files)}")
+        print(f"  ✏️  Modified: {len(self.modified_files)}")
+        print(f"  ➖ Deleted:  {len(self.deleted_files)}")
+    
+    def list_files(self, verbose=False):
+        """List all changed files"""
+        print(f"\n📁 Changed Files: {self.from_branch} → {self.to_branch}")
+        print("=" * 50)
+        
+        if verbose:
+            if self.added_files:
+                print("\n➕ Added files:")
+                for f in sorted(self.added_files):
+                    print(f"  + {f}")
+            
+            if self.modified_files:
+                print("\n✏️  Modified files:")
+                for f in sorted(self.modified_files):
+                    print(f"  M {f}")
+            
+            if self.deleted_files:
+                print("\n➖ Deleted files:")
+                for f in sorted(self.deleted_files):
+                    print(f"  - {f}")
+        else:
+            for f in sorted(self.changed_files):
+                print(f"  {f}")
+        
+        if self.deleted_files:
+            print(f"\n⚠️  Note: {len(self.deleted_files)} deleted files won't be included in archive")
+    
+    def create_archive(self, output_file=None, include_deleted_list=True):
+        """
+        Create tar.gz archive of changed files
+        
+        NOTE: Archive contains files from the TO branch. Ensure branches are
+        up-to-date (git fetch/pull) for accurate deployment packages!
+        """
+        if not self.changed_files:
+            print("No files to archive (no additions or modifications)")
+            return False
+        
+        # Generate default filename if not provided
+        if not output_file:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_from = self.from_branch.replace('/', '_')
+            safe_to = self.to_branch.replace('/', '_')
+            output_file = f"upgrade_{safe_from}_to_{safe_to}_{timestamp}.tar.gz"
+        
+        print(f"\n📦 Creating archive: {output_file}")
+        print(f"   Including {len(self.changed_files)} changed files")
+        
+        try:
+            # Create temporary directory for archive contents
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                
+                # Check out files from target branch
+                for filepath in self.changed_files:
+                    # Get file content from target branch
+                    try:
+                        result = subprocess.run(
+                            ['git', 'show', f'{self.to_branch}:{filepath}'],
+                            check=True, capture_output=True
+                        )
+                        
+                        # Create directory structure in temp dir
+                        file_path = temp_path / filepath
+                        file_path.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        # Write file content
+                        file_path.write_bytes(result.stdout)
+                        
+                    except subprocess.CalledProcessError:
+                        print(f"  ⚠️  Warning: Could not get file '{filepath}'")
+                        continue
+                
+                # Add manifest file
+                manifest_path = temp_path / "UPGRADE_MANIFEST.txt"
+                with open(manifest_path, 'w') as f:
+                    f.write(f"Upgrade Package Manifest\n")
+                    f.write(f"="*50 + "\n")
+                    f.write(f"From Branch: {self.from_branch}\n")
+                    f.write(f"To Branch:   {self.to_branch}\n")
+                    f.write(f"Created:     {datetime.now().isoformat()}\n")
+                    f.write(f"Files:       {len(self.changed_files)}\n")
+                    f.write("\n")
+                    f.write("⚠️  IMPORTANT: Ensure branches were up-to-date when archive was created!\n")
+                    f.write("   If branches were outdated, this package may not reflect actual changes.\n")
+                    f.write("\n")
+                    f.write("Changed Files (will be updated/added):\n")
+                    f.write("-"*30 + "\n")
+                    for filepath in sorted(self.changed_files):
+                        f.write(f"  {filepath}\n")
+                    
+                    if self.deleted_files and include_deleted_list:
+                        f.write("\n")
+                        f.write("Files to Delete (⚠️  MANUAL ACTION REQUIRED):\n")
+                        f.write("-"*30 + "\n")
+                        for filepath in sorted(self.deleted_files):
+                            f.write(f"  DELETE: {filepath}\n")
+                        f.write("\n")
+                        f.write("Delete these files after extracting the archive.\n")
+                
+                # Create tar.gz archive
+                with tarfile.open(output_file, "w:gz") as tar:
+                    for item in temp_path.iterdir():
+                        tar.add(item, arcname=item.relative_to(temp_path))
+                
+                # Get archive size
+                size = os.path.getsize(output_file)
+                size_mb = size / (1024 * 1024)
+                
+                print(f"✅ Archive created successfully: {output_file}")
+                print(f"   Size: {size_mb:.2f} MB")
+                print(f"\n📋 Deployment Instructions:")
+                print(f"   1. Transfer archive to target server")
+                print(f"   2. Backup current deployment first!")
+                print(f"   3. Extract in deployment directory: tar -xzf {output_file}")
+                print(f"   4. Review UPGRADE_MANIFEST.txt for important notes")
+                if self.deleted_files:
+                    print(f"   5. ⚠️  MANUALLY DELETE {len(self.deleted_files)} files listed in manifest")
+                    print(f"   6. Restart services/clear caches as needed")
+                else:
+                    print(f"   5. Restart services/clear caches as needed")
+                print(f"\n💡 Tip: Always test upgrades in staging environment first!")
+                
+                return True
+                
+        except Exception as e:
+            print(f"Error creating archive: {e}", file=sys.stderr)
+            return False
+    
+    def show_diff_stats(self):
+        """Show detailed statistics about the changes"""
+        try:
+            print(f"\n📈 Detailed Statistics: {self.from_branch} → {self.to_branch}")
+            print("=" * 50)
+            
+            # Get detailed stats
+            result = subprocess.run(
+                ['git', 'diff', '--stat', f'{self.from_branch}..{self.to_branch}'],
+                check=True, capture_output=True, text=True
+            )
+            
+            print(result.stdout)
+            
+        except subprocess.CalledProcessError as e:
+            print(f"Error getting statistics: {e}", file=sys.stderr)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Compare git branches and create upgrade archives',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+⚠️  IMPORTANT: Ensure branches are up-to-date before comparing!
+   Run 'git fetch --all' or use the --fetch flag
+
+Examples:
+  %(prog)s main feature/new-ui --count
+    Count changed files between main and feature/new-ui
+    
+  %(prog)s v1.0.0 v2.0.0 --list --fetch
+    Fetch updates then list all changed files between versions
+    
+  %(prog)s production staging --archive
+    Create upgrade archive from production to staging
+    
+  %(prog)s main develop --all --output upgrade.tar.gz
+    Do everything and save archive as upgrade.tar.gz
+    
+  %(prog)s old-prod new-prod --archive --no-check
+    Skip update checks (use with caution!)
+
+Deployment Workflow:
+  1. git fetch --all (or use --fetch flag)
+  2. %(prog)s prod-v1 prod-v2 --archive
+  3. Transfer archive to server
+  4. Backup current deployment
+  5. tar -xzf upgrade_*.tar.gz
+  6. Review UPGRADE_MANIFEST.txt
+  7. Delete files if listed in manifest
+        """
+    )
+    
+    parser.add_argument('from_branch', help='Base/starting branch (FROM)')
+    parser.add_argument('to_branch', help='Target/ending branch (TO)')
+    
+    # Action arguments
+    parser.add_argument('-c', '--count', action='store_true',
+                       help='Show count of changed files')
+    parser.add_argument('-l', '--list', action='store_true',
+                       help='List all changed files')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                       help='Verbose output (categorize files by change type)')
+    parser.add_argument('-s', '--stats', action='store_true',
+                       help='Show detailed diff statistics')
+    parser.add_argument('-a', '--archive', action='store_true',
+                       help='Create tar.gz archive of changed files')
+    parser.add_argument('-o', '--output', type=str,
+                       help='Output filename for archive (default: auto-generated)')
+    parser.add_argument('--all', action='store_true',
+                       help='Perform all operations (count, list, stats, archive)')
+    
+    # Update control arguments
+    parser.add_argument('--fetch', action='store_true',
+                       help='Fetch latest changes from remotes before comparing')
+    parser.add_argument('--no-check', action='store_true',
+                       help='Skip checking if branches are up-to-date (use with caution!)')
+    parser.add_argument('--no-deleted-list', action='store_true',
+                       help='Don\'t include deleted files list in manifest')
+    
+    args = parser.parse_args()
+    
+    # If no specific action is requested, default to count
+    if not any([args.count, args.list, args.archive, args.stats, args.all]):
+        args.count = True
+    
+    # Create diff analyzer
+    diff = GitBranchDiff(args.from_branch, args.to_branch)
+    
+    # Verify we're in a git repo
+    if not diff.verify_git_repo():
+        return 1
+    
+    # Fetch updates if requested
+    if args.fetch:
+        if not diff.fetch_updates():
+            response = input("Failed to fetch. Continue anyway? (y/N): ")
+            if response.lower() != 'y':
+                return 1
+    
+    # Verify branches exist and check if they're up-to-date
+    if not diff.verify_branches(check_updates=not args.no_check):
+        return 1
+    
+    # Show warning if skipping update checks
+    if args.no_check:
+        print("⚠️  Skipping branch update checks - results may not reflect remote changes")
+    
+    # Get changed files
+    if not diff.get_changed_files():
+        return 1
+    
+    # Check if there are any changes
+    if not diff.changed_files and not diff.deleted_files:
+        print(f"✨ No changes between {args.from_branch} and {args.to_branch}")
+        return 0
+    
+    # Perform requested operations
+    if args.count or args.all:
+        diff.count_files()
+    
+    if args.list or args.all:
+        diff.list_files(verbose=args.verbose)
+    
+    if args.stats or args.all:
+        diff.show_diff_stats()
+    
+    if args.archive or args.all:
+        success = diff.create_archive(
+            output_file=args.output,
+            include_deleted_list=not args.no_deleted_list
+        )
+        if not success:
+            return 1
+    
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())
